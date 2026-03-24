@@ -2,8 +2,11 @@ import 'dart:io';
 import 'dart:math' as math;
 
 import 'package:camera/camera.dart';
+import 'package:cloud_firestore/cloud_firestore.dart';
+import 'package:firebase_storage/firebase_storage.dart';
 import 'package:flutter/material.dart';
 import 'package:image_picker/image_picker.dart';
+import 'package:uuid/uuid.dart';
 
 import 'result_page.dart';
 
@@ -271,7 +274,7 @@ class _CameraPageState extends State<CameraPage>
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-//  IMAGE PREVIEW PAGE  — draggable crop border + zoom slider
+//  IMAGE PREVIEW PAGE  — resizable vital crop border + scanner effect
 // ════════════════════════════════════════════════════════════════════════════
 class ImagePreviewPage extends StatefulWidget {
   final String imagePath;
@@ -287,24 +290,44 @@ class ImagePreviewPage extends StatefulWidget {
   State<ImagePreviewPage> createState() => _ImagePreviewPageState();
 }
 
-class _ImagePreviewPageState extends State<ImagePreviewPage> {
+class _ImagePreviewPageState extends State<ImagePreviewPage>
+    with TickerProviderStateMixin {
   final TransformationController _transformCtrl = TransformationController();
   double _sliderValue = 0.0;
 
   // Crop rect (normalised 0–1 relative to image container)
-  Rect _crop = const Rect.fromLTWH(0.05, 0.05, 0.90, 0.90);
+  Rect _crop = const Rect.fromLTWH(0.08, 0.08, 0.84, 0.84);
 
   static const double _minScale = 1.0;
   static const double _maxScale = 3.5;
-  static const double _handleSize = 14.0;
+  static const double _handleSize = 16.0;
 
-  // Extra images added by user
   late List<String> _images;
+
+  // Scanner animation
+  late AnimationController _scanCtrl;
+  late Animation<double> _scanAnim;
+  bool _isScanning = false;
+  bool _isUploading = false;
 
   @override
   void initState() {
     super.initState();
     _images = [widget.imagePath, ...widget.extraImages];
+
+    _scanCtrl = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 1800),
+    );
+    _scanAnim = Tween<double>(
+      begin: 0.0,
+      end: 1.0,
+    ).animate(CurvedAnimation(parent: _scanCtrl, curve: Curves.easeInOut));
+    _scanCtrl.addStatusListener((status) {
+      if (status == AnimationStatus.completed) {
+        _scanCtrl.repeat(reverse: true);
+      }
+    });
   }
 
   void _onSliderChanged(double v) {
@@ -320,27 +343,80 @@ class _ImagePreviewPageState extends State<ImagePreviewPage> {
     }
   }
 
-  void _goToResult() {
-    Navigator.of(context).push(
-      MaterialPageRoute<void>(builder: (_) => ResultPage(images: _images)),
-    );
+  /// Upload image to Firebase Storage, save metadata to Firestore,
+  /// then navigate to ResultPage.
+  Future<void> _goToResult() async {
+    if (_isUploading) return;
+
+    setState(() {
+      _isScanning = true;
+      _isUploading = true;
+    });
+    _scanCtrl.forward();
+
+    try {
+      // 1. Upload image to Firebase Storage
+      final scanId = const Uuid().v4();
+      final storageRef = FirebaseStorage.instance.ref().child(
+        'scans/$scanId/image.jpg',
+      );
+
+      final uploadTask = await storageRef.putFile(File(_images[0]));
+      final downloadUrl = await uploadTask.ref.getDownloadURL();
+
+      // 2. Save scan record to Firestore (status = pending, AI will fill result)
+      await FirebaseFirestore.instance.collection('scans').doc(scanId).set({
+        'id': scanId,
+        'imageUrl': downloadUrl,
+        'status': 'pending',
+        'createdAt': FieldValue.serverTimestamp(),
+      });
+
+      // 3. Keep scanner running a bit longer for UX polish
+      await Future.delayed(const Duration(milliseconds: 800));
+
+      if (!mounted) return;
+
+      _scanCtrl.stop();
+
+      // 4. Navigate to ResultPage
+      Navigator.of(context).pushReplacement(
+        MaterialPageRoute<void>(
+          builder: (_) => ResultPage(images: _images, scanId: scanId),
+        ),
+      );
+    } catch (e) {
+      debugPrint('Upload error: $e');
+      _scanCtrl.stop();
+      setState(() {
+        _isScanning = false;
+        _isUploading = false;
+      });
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Upload failed: $e'),
+            backgroundColor: Colors.redAccent,
+          ),
+        );
+      }
+    }
   }
 
   @override
   void dispose() {
     _transformCtrl.dispose();
+    _scanCtrl.dispose();
     super.dispose();
   }
 
   @override
   Widget build(BuildContext context) {
-    final size = MediaQuery.of(context).size;
-
     return Scaffold(
       backgroundColor: Colors.black,
       body: Stack(
         children: [
-          // ── Image + draggable crop overlay ──────────────────────────────
+          // ── Image + resizable crop overlay ──────────────────────────────
           Positioned.fill(
             child: LayoutBuilder(
               builder: (ctx, constraints) {
@@ -368,13 +444,30 @@ class _ImagePreviewPageState extends State<ImagePreviewPage> {
                       ),
                     ),
 
-                    // Crop border + handles (draggable)
-                    _DraggableCropOverlay(
-                      containerSize: Size(W, H),
-                      crop: _crop,
-                      handleSize: _handleSize,
-                      onCropChanged: (r) => setState(() => _crop = r),
-                    ),
+                    // Scanner line (animated, only while scanning)
+                    if (_isScanning)
+                      Positioned.fill(
+                        child: IgnorePointer(
+                          child: AnimatedBuilder(
+                            animation: _scanAnim,
+                            builder: (_, __) => CustomPaint(
+                              painter: _ScanLinePainter(
+                                crop: _crop,
+                                progress: _scanAnim.value,
+                              ),
+                            ),
+                          ),
+                        ),
+                      ),
+
+                    // Draggable crop overlay with resize handles
+                    if (!_isScanning)
+                      _DraggableCropOverlay(
+                        containerSize: Size(W, H),
+                        crop: _crop,
+                        handleSize: _handleSize,
+                        onCropChanged: (r) => setState(() => _crop = r),
+                      ),
                   ],
                 );
               },
@@ -382,49 +475,100 @@ class _ImagePreviewPageState extends State<ImagePreviewPage> {
           ),
 
           // ── Top bar ──────────────────────────────────────────────────────
-          Positioned(
-            top: 0,
-            left: 0,
-            right: 0,
-            child: SafeArea(
-              bottom: false,
-              child: Padding(
-                padding: const EdgeInsets.symmetric(
-                  horizontal: 16,
-                  vertical: 10,
-                ),
-                child: Row(
-                  children: [
-                    _iconBtn(Icons.close_rounded, () => Navigator.pop(context)),
-                    const Spacer(),
-                    Container(
-                      padding: const EdgeInsets.symmetric(
-                        horizontal: 14,
-                        vertical: 7,
+          if (!_isScanning)
+            Positioned(
+              top: 0,
+              left: 0,
+              right: 0,
+              child: SafeArea(
+                bottom: false,
+                child: Padding(
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 16,
+                    vertical: 10,
+                  ),
+                  child: Row(
+                    children: [
+                      _iconBtn(
+                        Icons.close_rounded,
+                        () => Navigator.pop(context),
                       ),
-                      decoration: BoxDecoration(
-                        color: Colors.black54,
-                        borderRadius: BorderRadius.circular(20),
-                      ),
-                      child: const Text(
-                        'Preview',
-                        style: TextStyle(
-                          color: Colors.white,
-                          fontSize: 14,
-                          fontWeight: FontWeight.w500,
+                      const Spacer(),
+                      Container(
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 14,
+                          vertical: 7,
+                        ),
+                        decoration: BoxDecoration(
+                          color: Colors.black54,
+                          borderRadius: BorderRadius.circular(20),
+                        ),
+                        child: const Text(
+                          'Preview',
+                          style: TextStyle(
+                            color: Colors.white,
+                            fontSize: 14,
+                            fontWeight: FontWeight.w500,
+                          ),
                         ),
                       ),
-                    ),
-                    const Spacer(),
-                    _iconBtn(Icons.add_photo_alternate_rounded, _addMoreImages),
-                  ],
+                      const Spacer(),
+                      _iconBtn(
+                        Icons.add_photo_alternate_rounded,
+                        _addMoreImages,
+                      ),
+                    ],
+                  ),
                 ),
               ),
             ),
-          ),
 
-          // ── Thumbnail strip (if multiple images) ─────────────────────────
-          if (_images.length > 1)
+          // ── Scanning overlay label ────────────────────────────────────────
+          if (_isScanning)
+            Positioned.fill(
+              child: Column(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  const Spacer(),
+                  Container(
+                    margin: const EdgeInsets.only(bottom: 120),
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 24,
+                      vertical: 12,
+                    ),
+                    decoration: BoxDecoration(
+                      color: Colors.black.withOpacity(0.72),
+                      borderRadius: BorderRadius.circular(30),
+                    ),
+                    child: const Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        SizedBox(
+                          width: 18,
+                          height: 18,
+                          child: CircularProgressIndicator(
+                            strokeWidth: 2,
+                            color: Color(0xFF6BCB77),
+                          ),
+                        ),
+                        SizedBox(width: 12),
+                        Text(
+                          'Scanning & Solving…',
+                          style: TextStyle(
+                            color: Colors.white,
+                            fontSize: 15,
+                            fontWeight: FontWeight.w500,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ],
+              ),
+            ),
+
+          // ── Thumbnail strip (if multiple images) ──────────────────────────
+          if (_images.length > 1 && !_isScanning)
             Positioned(
               left: 0,
               right: 0,
@@ -464,160 +608,165 @@ class _ImagePreviewPageState extends State<ImagePreviewPage> {
               ),
             ),
 
-          // ── Bottom panel ─────────────────────────────────────────────────
-          Positioned(
-            left: 0,
-            right: 0,
-            bottom: 0,
-            child: SafeArea(
-              top: false,
-              child: Container(
-                padding: const EdgeInsets.fromLTRB(20, 20, 20, 16),
-                decoration: BoxDecoration(
-                  gradient: LinearGradient(
-                    begin: Alignment.bottomCenter,
-                    end: Alignment.topCenter,
-                    colors: [
-                      Colors.black.withOpacity(0.96),
-                      Colors.black.withOpacity(0.75),
-                      Colors.transparent,
-                    ],
-                    stops: const [0.0, 0.55, 1.0],
-                  ),
-                ),
-                child: Column(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    // Zoom slider
-                    Row(
-                      children: [
-                        const Icon(
-                          Icons.photo_size_select_small_rounded,
-                          color: Colors.white54,
-                          size: 18,
-                        ),
-                        Expanded(
-                          child: SliderTheme(
-                            data: SliderTheme.of(context).copyWith(
-                              activeTrackColor: Colors.white,
-                              inactiveTrackColor: Colors.white24,
-                              thumbColor: Colors.white,
-                              overlayColor: Colors.white12,
-                              thumbShape: const RoundSliderThumbShape(
-                                enabledThumbRadius: 9,
-                              ),
-                              trackHeight: 3,
-                            ),
-                            child: Slider(
-                              value: _sliderValue,
-                              min: 0,
-                              max: 1,
-                              onChanged: _onSliderChanged,
-                            ),
-                          ),
-                        ),
-                        const Icon(
-                          Icons.photo_size_select_large_rounded,
-                          color: Colors.white,
-                          size: 22,
-                        ),
+          // ── Bottom panel ──────────────────────────────────────────────────
+          if (!_isScanning)
+            Positioned(
+              left: 0,
+              right: 0,
+              bottom: 0,
+              child: SafeArea(
+                top: false,
+                child: Container(
+                  padding: const EdgeInsets.fromLTRB(20, 20, 20, 16),
+                  decoration: BoxDecoration(
+                    gradient: LinearGradient(
+                      begin: Alignment.bottomCenter,
+                      end: Alignment.topCenter,
+                      colors: [
+                        Colors.black.withOpacity(0.96),
+                        Colors.black.withOpacity(0.75),
+                        Colors.transparent,
                       ],
+                      stops: const [0.0, 0.55, 1.0],
                     ),
-                    const SizedBox(height: 8),
-
-                    // Return | Solve
-                    Row(
-                      children: [
-                        // RETURN
-                        Expanded(
-                          child: GestureDetector(
-                            onTap: () => Navigator.pop(context),
-                            child: Container(
-                              padding: const EdgeInsets.symmetric(vertical: 15),
-                              decoration: BoxDecoration(
-                                color: Colors.white10,
-                                borderRadius: BorderRadius.circular(16),
-                                border: Border.all(
-                                  color: Colors.white24,
-                                  width: 1.2,
+                  ),
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      // Zoom slider
+                      Row(
+                        children: [
+                          const Icon(
+                            Icons.photo_size_select_small_rounded,
+                            color: Colors.white54,
+                            size: 18,
+                          ),
+                          Expanded(
+                            child: SliderTheme(
+                              data: SliderTheme.of(context).copyWith(
+                                activeTrackColor: Colors.white,
+                                inactiveTrackColor: Colors.white24,
+                                thumbColor: Colors.white,
+                                overlayColor: Colors.white12,
+                                thumbShape: const RoundSliderThumbShape(
+                                  enabledThumbRadius: 9,
                                 ),
+                                trackHeight: 3,
                               ),
-                              child: const Row(
-                                mainAxisAlignment: MainAxisAlignment.center,
-                                children: [
-                                  Icon(
-                                    Icons.arrow_back_rounded,
-                                    color: Colors.white,
-                                    size: 18,
-                                  ),
-                                  SizedBox(width: 8),
-                                  Text(
-                                    'Return',
-                                    style: TextStyle(
-                                      color: Colors.white,
-                                      fontSize: 15,
-                                      fontWeight: FontWeight.w500,
-                                    ),
-                                  ),
-                                ],
+                              child: Slider(
+                                value: _sliderValue,
+                                min: 0,
+                                max: 1,
+                                onChanged: _onSliderChanged,
                               ),
                             ),
                           ),
-                        ),
-                        const SizedBox(width: 12),
-                        // SOLVE
-                        Expanded(
-                          child: GestureDetector(
-                            onTap: _goToResult,
-                            child: Container(
-                              padding: const EdgeInsets.symmetric(vertical: 15),
-                              decoration: BoxDecoration(
-                                gradient: const LinearGradient(
-                                  colors: [
-                                    Color(0xFF6BCB77),
-                                    Color(0xFF4DB6AC),
+                          const Icon(
+                            Icons.photo_size_select_large_rounded,
+                            color: Colors.white,
+                            size: 22,
+                          ),
+                        ],
+                      ),
+                      const SizedBox(height: 8),
+
+                      // Return | Solve
+                      Row(
+                        children: [
+                          // RETURN
+                          Expanded(
+                            child: GestureDetector(
+                              onTap: () => Navigator.pop(context),
+                              child: Container(
+                                padding: const EdgeInsets.symmetric(
+                                  vertical: 15,
+                                ),
+                                decoration: BoxDecoration(
+                                  color: Colors.white10,
+                                  borderRadius: BorderRadius.circular(16),
+                                  border: Border.all(
+                                    color: Colors.white24,
+                                    width: 1.2,
+                                  ),
+                                ),
+                                child: const Row(
+                                  mainAxisAlignment: MainAxisAlignment.center,
+                                  children: [
+                                    Icon(
+                                      Icons.arrow_back_rounded,
+                                      color: Colors.white,
+                                      size: 18,
+                                    ),
+                                    SizedBox(width: 8),
+                                    Text(
+                                      'Return',
+                                      style: TextStyle(
+                                        color: Colors.white,
+                                        fontSize: 15,
+                                        fontWeight: FontWeight.w500,
+                                      ),
+                                    ),
                                   ],
                                 ),
-                                borderRadius: BorderRadius.circular(16),
-                                boxShadow: [
-                                  BoxShadow(
-                                    color: const Color(
-                                      0xFF6BCB77,
-                                    ).withOpacity(0.45),
-                                    blurRadius: 14,
-                                    offset: const Offset(0, 4),
-                                  ),
-                                ],
-                              ),
-                              child: const Row(
-                                mainAxisAlignment: MainAxisAlignment.center,
-                                children: [
-                                  Icon(
-                                    Icons.auto_fix_high_rounded,
-                                    color: Colors.white,
-                                    size: 18,
-                                  ),
-                                  SizedBox(width: 8),
-                                  Text(
-                                    'Solve',
-                                    style: TextStyle(
-                                      color: Colors.white,
-                                      fontSize: 15,
-                                      fontWeight: FontWeight.w600,
-                                    ),
-                                  ),
-                                ],
                               ),
                             ),
                           ),
-                        ),
-                      ],
-                    ),
-                  ],
+                          const SizedBox(width: 12),
+                          // SOLVE
+                          Expanded(
+                            child: GestureDetector(
+                              onTap: _goToResult,
+                              child: Container(
+                                padding: const EdgeInsets.symmetric(
+                                  vertical: 15,
+                                ),
+                                decoration: BoxDecoration(
+                                  gradient: const LinearGradient(
+                                    colors: [
+                                      Color(0xFF6BCB77),
+                                      Color(0xFF4DB6AC),
+                                    ],
+                                  ),
+                                  borderRadius: BorderRadius.circular(16),
+                                  boxShadow: [
+                                    BoxShadow(
+                                      color: const Color(
+                                        0xFF6BCB77,
+                                      ).withOpacity(0.45),
+                                      blurRadius: 14,
+                                      offset: const Offset(0, 4),
+                                    ),
+                                  ],
+                                ),
+                                child: const Row(
+                                  mainAxisAlignment: MainAxisAlignment.center,
+                                  children: [
+                                    Icon(
+                                      Icons.auto_fix_high_rounded,
+                                      color: Colors.white,
+                                      size: 18,
+                                    ),
+                                    SizedBox(width: 8),
+                                    Text(
+                                      'Solve',
+                                      style: TextStyle(
+                                        color: Colors.white,
+                                        fontSize: 15,
+                                        fontWeight: FontWeight.w600,
+                                      ),
+                                    ),
+                                  ],
+                                ),
+                              ),
+                            ),
+                          ),
+                        ],
+                      ),
+                    ],
+                  ),
                 ),
               ),
             ),
-          ),
         ],
       ),
     );
@@ -637,7 +786,65 @@ class _ImagePreviewPageState extends State<ImagePreviewPage> {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-//  CROP MASK PAINTER  — dims area outside crop rect
+//  SCAN LINE PAINTER  — animated green scanner beam inside crop area
+// ════════════════════════════════════════════════════════════════════════════
+class _ScanLinePainter extends CustomPainter {
+  final Rect crop; // normalised 0–1
+  final double progress; // 0–1
+
+  const _ScanLinePainter({required this.crop, required this.progress});
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final rect = Rect.fromLTWH(
+      crop.left * size.width,
+      crop.top * size.height,
+      crop.width * size.width,
+      crop.height * size.height,
+    );
+
+    // Clip to crop rect so scanner stays inside
+    canvas.save();
+    canvas.clipRect(rect);
+
+    final y = rect.top + rect.height * progress;
+
+    // Glow gradient beam
+    final beamPaint = Paint()
+      ..shader = LinearGradient(
+        begin: Alignment.topCenter,
+        end: Alignment.bottomCenter,
+        colors: [
+          Colors.transparent,
+          const Color(0xFF6BCB77).withOpacity(0.6),
+          const Color(0xFF6BCB77).withOpacity(0.9),
+          const Color(0xFF6BCB77).withOpacity(0.6),
+          Colors.transparent,
+        ],
+        stops: const [0.0, 0.35, 0.5, 0.65, 1.0],
+      ).createShader(Rect.fromLTWH(rect.left, y - 20, rect.width, 40));
+
+    canvas.drawRect(
+      Rect.fromLTWH(rect.left, y - 20, rect.width, 40),
+      beamPaint,
+    );
+
+    // Bright center line
+    final linePaint = Paint()
+      ..color = const Color(0xFF6BCB77)
+      ..strokeWidth = 2.5
+      ..style = PaintingStyle.stroke;
+    canvas.drawLine(Offset(rect.left, y), Offset(rect.right, y), linePaint);
+
+    canvas.restore();
+  }
+
+  @override
+  bool shouldRepaint(_ScanLinePainter old) => old.progress != progress;
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+//  CROP MASK PAINTER  — dims outside crop, draws vital border + handles
 // ════════════════════════════════════════════════════════════════════════════
 class _CropMaskPainter extends CustomPainter {
   final Rect crop; // normalised 0–1
@@ -651,29 +858,32 @@ class _CropMaskPainter extends CustomPainter {
       crop.width * size.width,
       crop.height * size.height,
     );
+
+    // Dark mask outside crop
     final mask = Paint()..color = Colors.black.withOpacity(0.52);
     final full = Rect.fromLTWH(0, 0, size.width, size.height);
-
-    // Draw mask with hole
     final path = Path()
       ..addRect(full)
       ..addRect(rect)
       ..fillType = PathFillType.evenOdd;
     canvas.drawPath(path, mask);
 
-    // Draw glowing border
+    // White outer border
     final borderPaint = Paint()
-      ..color = Colors.white
-      ..strokeWidth = 2
+      ..color = Colors.white.withOpacity(0.6)
+      ..strokeWidth = 1.5
       ..style = PaintingStyle.stroke;
     canvas.drawRect(rect, borderPaint);
 
-    // Corner handles
+    // Corner accent handles
     _drawCorners(canvas, rect);
+
+    // Mid-edge handles (visual only, drag logic in overlay)
+    _drawMidHandles(canvas, rect);
   }
 
   void _drawCorners(Canvas canvas, Rect r) {
-    const len = 20.0;
+    const len = 22.0;
     const w = 3.5;
     final p = Paint()
       ..color = const Color(0xFF6BCB77)
@@ -695,12 +905,37 @@ class _CropMaskPainter extends CustomPainter {
     canvas.drawLine(r.bottomRight, r.bottomRight + const Offset(0, -len), p);
   }
 
+  void _drawMidHandles(Canvas canvas, Rect r) {
+    const sz = 10.0;
+    final p = Paint()
+      ..color = Colors.white
+      ..style = PaintingStyle.fill;
+    final border = Paint()
+      ..color = const Color(0xFF6BCB77)
+      ..strokeWidth = 2
+      ..style = PaintingStyle.stroke;
+
+    final centers = [
+      Offset(r.center.dx, r.top), // top
+      Offset(r.center.dx, r.bottom), // bottom
+      Offset(r.left, r.center.dy), // left
+      Offset(r.right, r.center.dy), // right
+    ];
+
+    for (final c in centers) {
+      final hRect = Rect.fromCenter(center: c, width: sz * 1.8, height: sz);
+      final rrect = RRect.fromRectAndRadius(hRect, const Radius.circular(4));
+      canvas.drawRRect(rrect, p);
+      canvas.drawRRect(rrect, border);
+    }
+  }
+
   @override
   bool shouldRepaint(_CropMaskPainter old) => old.crop != crop;
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-//  DRAGGABLE CROP OVERLAY  — drag corners/edges/interior
+//  DRAGGABLE CROP OVERLAY  — drag corners / edges / interior
 // ════════════════════════════════════════════════════════════════════════════
 class _DraggableCropOverlay extends StatefulWidget {
   final Size containerSize;
@@ -748,10 +983,9 @@ class _DraggableCropOverlayState extends State<_DraggableCropOverlay> {
 
   _DragHandle _hitTest(Offset local) {
     final r = _px;
-    final h = widget.handleSize * 1.8;
+    final h = widget.handleSize * 2.0;
     bool near(double a, double b) => (a - b).abs() < h;
 
-    // Corners
     if (near(local.dx, r.left) && near(local.dy, r.top))
       return _DragHandle.topLeft;
     if (near(local.dx, r.right) && near(local.dy, r.top))
@@ -760,7 +994,6 @@ class _DraggableCropOverlayState extends State<_DraggableCropOverlay> {
       return _DragHandle.bottomLeft;
     if (near(local.dx, r.right) && near(local.dy, r.bottom))
       return _DragHandle.bottomRight;
-    // Edges
     if (near(local.dy, r.top) && local.dx > r.left && local.dx < r.right)
       return _DragHandle.top;
     if (near(local.dy, r.bottom) && local.dx > r.left && local.dx < r.right)
@@ -769,7 +1002,6 @@ class _DraggableCropOverlayState extends State<_DraggableCropOverlay> {
       return _DragHandle.left;
     if (near(local.dx, r.right) && local.dy > r.top && local.dy < r.bottom)
       return _DragHandle.right;
-    // Interior
     if (r.contains(local)) return _DragHandle.interior;
     return _DragHandle.none;
   }
@@ -836,21 +1068,19 @@ class _DraggableCropOverlayState extends State<_DraggableCropOverlay> {
   void _onPanEnd(DragEndDetails _) => _handle = _DragHandle.none;
 
   @override
-  Widget build(BuildContext context) {
-    return Positioned.fill(
-      child: GestureDetector(
-        onPanStart: _onPanStart,
-        onPanUpdate: _onPanUpdate,
-        onPanEnd: _onPanEnd,
-        behavior: HitTestBehavior.translucent,
-        child: const SizedBox.expand(),
-      ),
-    );
-  }
+  Widget build(BuildContext context) => Positioned.fill(
+    child: GestureDetector(
+      onPanStart: _onPanStart,
+      onPanUpdate: _onPanUpdate,
+      onPanEnd: _onPanEnd,
+      behavior: HitTestBehavior.translucent,
+      child: const SizedBox.expand(),
+    ),
+  );
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-//  SCAN FRAME PAINTER (camera viewfinder)
+//  SCAN FRAME PAINTER (camera viewfinder corners)
 // ════════════════════════════════════════════════════════════════════════════
 class _ScanFramePainter extends CustomPainter {
   @override
