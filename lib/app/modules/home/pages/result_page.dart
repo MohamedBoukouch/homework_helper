@@ -1,19 +1,19 @@
 import 'dart:convert';
 import 'dart:io';
 
-import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_markdown/flutter_markdown.dart';
 import 'package:http/http.dart' as http;
 
+import '../../../config/database_helper.dart';
+
 // ════════════════════════════════════════════════════════════════════════════
-//  RESULT PAGE  — calls AI (GPT-4o / Gemini) and displays the answer
+//  RESULT PAGE  — Qwen Vision via OpenRouter + SQLite local storage
 // ════════════════════════════════════════════════════════════════════════════
 class ResultPage extends StatefulWidget {
   final List<String> images;
-  final String scanId;
 
-  const ResultPage({super.key, required this.images, required this.scanId});
+  const ResultPage({super.key, required this.images});
 
   @override
   State<ResultPage> createState() => _ResultPageState();
@@ -21,19 +21,27 @@ class ResultPage extends StatefulWidget {
 
 class _ResultPageState extends State<ResultPage>
     with SingleTickerProviderStateMixin {
-  String _status = 'Extracting text from image…';
+  String _status = 'Preparing image…';
   String _result = '';
   bool _isLoading = true;
   bool _hasError = false;
+  int? _savedId;
 
   late AnimationController _dotCtrl;
   late Animation<int> _dotAnim;
 
-  // ── Replace with your actual keys ────────────────────────────────────────
-  static const _openAiKey = 'YOUR_OPENAI_API_KEY';
-  static const _geminiKey = 'YOUR_GEMINI_API_KEY';
-  // Set to true to use Gemini, false to use GPT-4o
-  static const _useGemini = false;
+  // ── 🔑  Paste your OpenRouter key here (free at openrouter.ai → Keys) ─────
+  static const _openRouterKey =
+      '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';
+
+  // Free vision models tried in order — first one that works is used.
+  // All confirmed available as of March 2026 on OpenRouter free tier.
+  static const _models = [
+    'qwen/qwen2.5-vl-32b-instruct:free',
+    'qwen/qwen2.5-vl-72b-instruct:free',
+    'meta-llama/llama-3.2-11b-vision-instruct:free',
+    'mistralai/mistral-small-3.1-24b-instruct:free',
+  ];
   // ─────────────────────────────────────────────────────────────────────────
 
   @override
@@ -44,7 +52,7 @@ class _ResultPageState extends State<ResultPage>
       duration: const Duration(milliseconds: 900),
     )..repeat();
     _dotAnim = IntTween(begin: 0, end: 3).animate(_dotCtrl);
-    _runAIPipeline();
+    _runPipeline();
   }
 
   @override
@@ -53,37 +61,24 @@ class _ResultPageState extends State<ResultPage>
     super.dispose();
   }
 
-  // ── Main pipeline ─────────────────────────────────────────────────────────
-  Future<void> _runAIPipeline() async {
+  // ── Pipeline ──────────────────────────────────────────────────────────────
+  Future<void> _runPipeline() async {
     try {
-      // Step 1 – read imageUrl stored by camera page
-      setState(() => _status = 'Reading scan data…');
-      final doc = await FirebaseFirestore.instance
-          .collection('scans')
-          .doc(widget.scanId)
-          .get();
-      final imageUrl = doc.data()?['imageUrl'] as String? ?? '';
-
-      // Step 2 – call AI
-      setState(
-        () => _status = _useGemini
-            ? 'Calling Gemini Vision…'
-            : 'Calling GPT-4o Vision…',
+      setState(() => _status = 'Saving scan locally…');
+      final record = ScanRecord(
+        imagePath: widget.images.isNotEmpty ? widget.images[0] : '',
+        result: '',
+        status: 'pending',
+        createdAt: DateTime.now(),
       );
+      _savedId = await DatabaseHelper.instance.insertScan(record);
 
-      final answer = _useGemini
-          ? await _callGemini(imageUrl)
-          : await _callGpt4o(imageUrl);
+      setState(() => _status = 'Calling Qwen Vision…');
+      final answer = await _callWithFallback(widget.images[0]);
 
-      // Step 3 – persist result to Firestore
-      await FirebaseFirestore.instance
-          .collection('scans')
-          .doc(widget.scanId)
-          .update({
-            'result': answer,
-            'status': 'done',
-            'solvedAt': FieldValue.serverTimestamp(),
-          });
+      if (_savedId != null) {
+        await DatabaseHelper.instance.updateScan(_savedId!, answer, 'done');
+      }
 
       if (!mounted) return;
       setState(() {
@@ -92,90 +87,107 @@ class _ResultPageState extends State<ResultPage>
         _status = 'Done';
       });
     } catch (e) {
-      debugPrint('AI pipeline error: $e');
+      debugPrint('Pipeline error: $e');
+      if (_savedId != null) {
+        await DatabaseHelper.instance.updateScan(
+          _savedId!,
+          'Error: $e',
+          'error',
+        );
+      }
       if (!mounted) return;
       setState(() {
         _hasError = true;
         _isLoading = false;
         _status = 'Error';
-        _result = 'Something went wrong: $e';
+        _result = 'Something went wrong:\n$e';
       });
     }
   }
 
-  // ── GPT-4o Vision ─────────────────────────────────────────────────────────
-  Future<String> _callGpt4o(String imageUrl) async {
-    final response = await http.post(
-      Uri.parse('https://api.openai.com/v1/chat/completions'),
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': 'Bearer $_openAiKey',
-      },
-      body: jsonEncode({
-        'model': 'gpt-4o',
-        'messages': [
-          {
-            'role': 'user',
-            'content': [
-              {
-                'type': 'text',
-                'text':
-                    'You are an expert tutor. Look at this image and solve the problem or answer the question shown. Provide a clear, step-by-step explanation.',
-              },
-              {
-                'type': 'image_url',
-                'image_url': {'url': imageUrl, 'detail': 'high'},
-              },
-            ],
-          },
-        ],
-        'max_tokens': 1500,
-      }),
-    );
-
-    if (response.statusCode != 200) {
-      throw Exception('GPT-4o error ${response.statusCode}: ${response.body}');
+  // ── Try each free model in order until one succeeds ───────────────────────
+  Future<String> _callWithFallback(String imagePath) async {
+    Exception? lastError;
+    for (final model in _models) {
+      try {
+        debugPrint('Trying model: $model');
+        if (mounted) setState(() => _status = 'Calling $model…');
+        return await _callOpenRouter(imagePath, model);
+      } catch (e) {
+        debugPrint('Model $model failed: $e');
+        lastError = Exception('$model failed: $e');
+      }
     }
-
-    final json = jsonDecode(response.body);
-    return json['choices'][0]['message']['content'] as String;
+    throw lastError ?? Exception('All models failed.');
   }
 
-  // ── Gemini 1.5 Pro Vision ─────────────────────────────────────────────────
-  Future<String> _callGemini(String imageUrl) async {
-    // Download image bytes to send as inline_data
-    final imgBytes = (await http.get(Uri.parse(imageUrl))).bodyBytes;
-    final base64Img = base64Encode(imgBytes);
+  // ── OpenRouter vision call (OpenAI-compatible format) ─────────────────────
+  Future<String> _callOpenRouter(String imagePath, String model) async {
+    final imageBytes = await File(imagePath).readAsBytes();
+    final base64Image = base64Encode(imageBytes);
 
-    final response = await http.post(
-      Uri.parse(
-        'https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-pro:generateContent?key=$_geminiKey',
-      ),
-      headers: {'Content-Type': 'application/json'},
-      body: jsonEncode({
-        'contents': [
-          {
-            'parts': [
+    final ext = imagePath.toLowerCase().split('.').last;
+    final mimeType = ext == 'png' ? 'image/png' : 'image/jpeg';
+
+    final uri = Uri.parse('https://openrouter.ai/api/v1/chat/completions');
+
+    final response = await http
+        .post(
+          uri,
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': 'Bearer $_openRouterKey',
+            'HTTP-Referer': 'https://ai-tutor-app.com',
+            'X-Title': 'AI Tutor App',
+          },
+          body: jsonEncode({
+            'model': model,
+            'messages': [
               {
-                'text':
-                    'You are an expert tutor. Look at this image and solve the problem or answer the question shown. Provide a clear, step-by-step explanation.',
-              },
-              {
-                'inline_data': {'mime_type': 'image/jpeg', 'data': base64Img},
+                'role': 'user',
+                'content': [
+                  {
+                    'type': 'text',
+                    'text':
+                        'You are an expert tutor. Look at this image carefully and solve the problem or answer the question shown. Provide a clear, step-by-step explanation formatted in Markdown.',
+                  },
+                  {
+                    'type': 'image_url',
+                    'image_url': {'url': 'data:$mimeType;base64,$base64Image'},
+                  },
+                ],
               },
             ],
-          },
-        ],
-        'generationConfig': {'maxOutputTokens': 1500},
-      }),
-    );
+            'max_tokens': 2048,
+            'temperature': 0.3,
+          }),
+        )
+        .timeout(const Duration(seconds: 60));
 
     if (response.statusCode != 200) {
-      throw Exception('Gemini error ${response.statusCode}: ${response.body}');
+      throw Exception(
+        'OpenRouter error ${response.statusCode}: ${response.body}',
+      );
     }
 
-    final json = jsonDecode(response.body);
-    return json['candidates'][0]['content']['parts'][0]['text'] as String;
+    final json = jsonDecode(response.body) as Map<String, dynamic>;
+
+    // Check for API-level error inside a 200 response
+    if (json.containsKey('error')) {
+      throw Exception('API error: ${json['error']}');
+    }
+
+    final choices = json['choices'] as List<dynamic>?;
+    if (choices == null || choices.isEmpty) {
+      throw Exception('No choices returned.');
+    }
+    final message = choices[0]['message'] as Map<String, dynamic>?;
+    if (message == null) throw Exception('Empty message in response.');
+    final content = message['content'];
+    if (content == null || (content is String && content.trim().isEmpty)) {
+      throw Exception('Empty content in response.');
+    }
+    return content as String;
   }
 
   // ── UI ────────────────────────────────────────────────────────────────────
@@ -223,7 +235,6 @@ class _ResultPageState extends State<ResultPage>
             ),
           ),
           const Spacer(),
-          // AI badge
           Container(
             padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
             decoration: BoxDecoration(
@@ -232,9 +243,9 @@ class _ResultPageState extends State<ResultPage>
               ),
               borderRadius: BorderRadius.circular(20),
             ),
-            child: Text(
-              _useGemini ? 'Gemini' : 'GPT-4o',
-              style: const TextStyle(
+            child: const Text(
+              'Qwen AI',
+              style: TextStyle(
                 color: Colors.white,
                 fontSize: 12,
                 fontWeight: FontWeight.w600,
@@ -250,7 +261,6 @@ class _ResultPageState extends State<ResultPage>
     child: Column(
       mainAxisSize: MainAxisSize.min,
       children: [
-        // Animated scanner icon
         Container(
           width: 80,
           height: 80,
@@ -304,7 +314,6 @@ class _ResultPageState extends State<ResultPage>
     child: Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        // Thumbnail
         if (widget.images.isNotEmpty)
           ClipRRect(
             borderRadius: BorderRadius.circular(14),
@@ -317,7 +326,28 @@ class _ResultPageState extends State<ResultPage>
           ),
         const SizedBox(height: 20),
 
-        // Result card
+        if (_savedId != null && !_hasError)
+          Padding(
+            padding: const EdgeInsets.only(bottom: 12),
+            child: Row(
+              children: [
+                const Icon(
+                  Icons.check_circle_outline_rounded,
+                  color: Color(0xFF6BCB77),
+                  size: 16,
+                ),
+                const SizedBox(width: 6),
+                Text(
+                  'Saved locally (ID: $_savedId)',
+                  style: const TextStyle(
+                    color: Color(0xFF6BCB77),
+                    fontSize: 12,
+                  ),
+                ),
+              ],
+            ),
+          ),
+
         Container(
           width: double.infinity,
           padding: const EdgeInsets.all(18),
@@ -333,6 +363,7 @@ class _ResultPageState extends State<ResultPage>
           ),
           child: _hasError
               ? Row(
+                  crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
                     const Icon(
                       Icons.error_outline_rounded,
@@ -355,7 +386,7 @@ class _ResultPageState extends State<ResultPage>
                   data: _result,
                   styleSheet: MarkdownStyleSheet(
                     p: const TextStyle(
-                      color: Colors.white38,
+                      color: Colors.white70,
                       fontSize: 15,
                       height: 1.6,
                     ),
@@ -390,7 +421,6 @@ class _ResultPageState extends State<ResultPage>
 
         const SizedBox(height: 24),
 
-        // Try again button
         if (_hasError)
           GestureDetector(
             onTap: () {
@@ -399,7 +429,7 @@ class _ResultPageState extends State<ResultPage>
                 _hasError = false;
                 _result = '';
               });
-              _runAIPipeline();
+              _runPipeline();
             },
             child: Container(
               width: double.infinity,
@@ -424,6 +454,38 @@ class _ResultPageState extends State<ResultPage>
                     ),
                   ),
                 ],
+              ),
+            ),
+          ),
+
+        if (!_hasError && !_isLoading)
+          Padding(
+            padding: const EdgeInsets.only(top: 12),
+            child: GestureDetector(
+              onTap: () => Navigator.pushReplacementNamed(context, '/history'),
+              child: Container(
+                width: double.infinity,
+                padding: const EdgeInsets.symmetric(vertical: 15),
+                decoration: BoxDecoration(
+                  color: Colors.white10,
+                  borderRadius: BorderRadius.circular(16),
+                  border: Border.all(color: Colors.white24, width: 1.2),
+                ),
+                child: const Row(
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  children: [
+                    Icon(Icons.history_rounded, color: Colors.white, size: 18),
+                    SizedBox(width: 8),
+                    Text(
+                      'View History',
+                      style: TextStyle(
+                        color: Colors.white,
+                        fontSize: 15,
+                        fontWeight: FontWeight.w500,
+                      ),
+                    ),
+                  ],
+                ),
               ),
             ),
           ),

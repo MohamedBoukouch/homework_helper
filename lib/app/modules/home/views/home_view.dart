@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:get/get.dart';
 import 'package:homework_helper/app/modules/home/pages/camera_page.dart';
+import 'package:homework_helper/app/modules/settings/views/settings_view.dart';
 import '../widgets/home_slider.dart';
 import '../widgets/home_services.dart';
 
@@ -20,7 +21,7 @@ class _HomeViewState extends State<HomeView> {
     const Center(child: Text('AI Tutor Page')), // AI Tutor
     const SizedBox.shrink(), // Placeholder for Scan, will open new page
     const Center(child: Text('History Page')), // History
-    const Center(child: Text('Settings Page')), // Settings
+    const SettingsView(),
   ];
 
   @override

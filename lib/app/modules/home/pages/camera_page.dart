@@ -2,11 +2,8 @@ import 'dart:io';
 import 'dart:math' as math;
 
 import 'package:camera/camera.dart';
-import 'package:cloud_firestore/cloud_firestore.dart';
-import 'package:firebase_storage/firebase_storage.dart';
 import 'package:flutter/material.dart';
 import 'package:image_picker/image_picker.dart';
-import 'package:uuid/uuid.dart';
 
 import 'result_page.dart';
 
@@ -274,7 +271,7 @@ class _CameraPageState extends State<CameraPage>
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-//  IMAGE PREVIEW PAGE  — resizable vital crop border + scanner effect
+//  IMAGE PREVIEW PAGE
 // ════════════════════════════════════════════════════════════════════════════
 class ImagePreviewPage extends StatefulWidget {
   final String imagePath;
@@ -295,7 +292,6 @@ class _ImagePreviewPageState extends State<ImagePreviewPage>
   final TransformationController _transformCtrl = TransformationController();
   double _sliderValue = 0.0;
 
-  // Crop rect (normalised 0–1 relative to image container)
   Rect _crop = const Rect.fromLTWH(0.08, 0.08, 0.84, 0.84);
 
   static const double _minScale = 1.0;
@@ -304,11 +300,10 @@ class _ImagePreviewPageState extends State<ImagePreviewPage>
 
   late List<String> _images;
 
-  // Scanner animation
   late AnimationController _scanCtrl;
   late Animation<double> _scanAnim;
   bool _isScanning = false;
-  bool _isUploading = false;
+  bool _isProcessing = false;
 
   @override
   void initState() {
@@ -343,64 +338,26 @@ class _ImagePreviewPageState extends State<ImagePreviewPage>
     }
   }
 
-  /// Upload image to Firebase Storage, save metadata to Firestore,
-  /// then navigate to ResultPage.
+  /// Navigate to ResultPage directly — no upload, just pass local path.
   Future<void> _goToResult() async {
-    if (_isUploading) return;
+    if (_isProcessing) return;
 
     setState(() {
       _isScanning = true;
-      _isUploading = true;
+      _isProcessing = true;
     });
     _scanCtrl.forward();
 
-    try {
-      // 1. Upload image to Firebase Storage
-      final scanId = const Uuid().v4();
-      final storageRef = FirebaseStorage.instance.ref().child(
-        'scans/$scanId/image.jpg',
-      );
+    // Brief UX pause so the scanner animation feels intentional
+    await Future.delayed(const Duration(milliseconds: 900));
 
-      final uploadTask = await storageRef.putFile(File(_images[0]));
-      final downloadUrl = await uploadTask.ref.getDownloadURL();
+    if (!mounted) return;
 
-      // 2. Save scan record to Firestore (status = pending, AI will fill result)
-      await FirebaseFirestore.instance.collection('scans').doc(scanId).set({
-        'id': scanId,
-        'imageUrl': downloadUrl,
-        'status': 'pending',
-        'createdAt': FieldValue.serverTimestamp(),
-      });
+    _scanCtrl.stop();
 
-      // 3. Keep scanner running a bit longer for UX polish
-      await Future.delayed(const Duration(milliseconds: 800));
-
-      if (!mounted) return;
-
-      _scanCtrl.stop();
-
-      // 4. Navigate to ResultPage
-      Navigator.of(context).pushReplacement(
-        MaterialPageRoute<void>(
-          builder: (_) => ResultPage(images: _images, scanId: scanId),
-        ),
-      );
-    } catch (e) {
-      debugPrint('Upload error: $e');
-      _scanCtrl.stop();
-      setState(() {
-        _isScanning = false;
-        _isUploading = false;
-      });
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: Text('Upload failed: $e'),
-            backgroundColor: Colors.redAccent,
-          ),
-        );
-      }
-    }
+    Navigator.of(context).pushReplacement(
+      MaterialPageRoute<void>(builder: (_) => ResultPage(images: _images)),
+    );
   }
 
   @override
@@ -424,7 +381,6 @@ class _ImagePreviewPageState extends State<ImagePreviewPage>
                 final H = constraints.maxHeight;
                 return Stack(
                   children: [
-                    // Pinch-zoom image
                     Positioned.fill(
                       child: InteractiveViewer(
                         transformationController: _transformCtrl,
@@ -436,15 +392,11 @@ class _ImagePreviewPageState extends State<ImagePreviewPage>
                         ),
                       ),
                     ),
-
-                    // Dark mask outside crop rect
                     Positioned.fill(
                       child: IgnorePointer(
                         child: CustomPaint(painter: _CropMaskPainter(_crop)),
                       ),
                     ),
-
-                    // Scanner line (animated, only while scanning)
                     if (_isScanning)
                       Positioned.fill(
                         child: IgnorePointer(
@@ -459,8 +411,6 @@ class _ImagePreviewPageState extends State<ImagePreviewPage>
                           ),
                         ),
                       ),
-
-                    // Draggable crop overlay with resize handles
                     if (!_isScanning)
                       _DraggableCropOverlay(
                         containerSize: Size(W, H),
@@ -553,7 +503,7 @@ class _ImagePreviewPageState extends State<ImagePreviewPage>
                         ),
                         SizedBox(width: 12),
                         Text(
-                          'Scanning & Solving…',
+                          'Scanning…',
                           style: TextStyle(
                             color: Colors.white,
                             fontSize: 15,
@@ -567,7 +517,7 @@ class _ImagePreviewPageState extends State<ImagePreviewPage>
               ),
             ),
 
-          // ── Thumbnail strip (if multiple images) ──────────────────────────
+          // ── Thumbnail strip ───────────────────────────────────────────────
           if (_images.length > 1 && !_isScanning)
             Positioned(
               left: 0,
@@ -633,7 +583,6 @@ class _ImagePreviewPageState extends State<ImagePreviewPage>
                   child: Column(
                     mainAxisSize: MainAxisSize.min,
                     children: [
-                      // Zoom slider
                       Row(
                         children: [
                           const Icon(
@@ -669,11 +618,8 @@ class _ImagePreviewPageState extends State<ImagePreviewPage>
                         ],
                       ),
                       const SizedBox(height: 8),
-
-                      // Return | Solve
                       Row(
                         children: [
-                          // RETURN
                           Expanded(
                             child: GestureDetector(
                               onTap: () => Navigator.pop(context),
@@ -712,7 +658,6 @@ class _ImagePreviewPageState extends State<ImagePreviewPage>
                             ),
                           ),
                           const SizedBox(width: 12),
-                          // SOLVE
                           Expanded(
                             child: GestureDetector(
                               onTap: _goToResult,
@@ -786,11 +731,11 @@ class _ImagePreviewPageState extends State<ImagePreviewPage>
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-//  SCAN LINE PAINTER  — animated green scanner beam inside crop area
+//  SCAN LINE PAINTER
 // ════════════════════════════════════════════════════════════════════════════
 class _ScanLinePainter extends CustomPainter {
-  final Rect crop; // normalised 0–1
-  final double progress; // 0–1
+  final Rect crop;
+  final double progress;
 
   const _ScanLinePainter({required this.crop, required this.progress});
 
@@ -803,13 +748,11 @@ class _ScanLinePainter extends CustomPainter {
       crop.height * size.height,
     );
 
-    // Clip to crop rect so scanner stays inside
     canvas.save();
     canvas.clipRect(rect);
 
     final y = rect.top + rect.height * progress;
 
-    // Glow gradient beam
     final beamPaint = Paint()
       ..shader = LinearGradient(
         begin: Alignment.topCenter,
@@ -829,7 +772,6 @@ class _ScanLinePainter extends CustomPainter {
       beamPaint,
     );
 
-    // Bright center line
     final linePaint = Paint()
       ..color = const Color(0xFF6BCB77)
       ..strokeWidth = 2.5
@@ -844,10 +786,10 @@ class _ScanLinePainter extends CustomPainter {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-//  CROP MASK PAINTER  — dims outside crop, draws vital border + handles
+//  CROP MASK PAINTER
 // ════════════════════════════════════════════════════════════════════════════
 class _CropMaskPainter extends CustomPainter {
-  final Rect crop; // normalised 0–1
+  final Rect crop;
   const _CropMaskPainter(this.crop);
 
   @override
@@ -859,7 +801,6 @@ class _CropMaskPainter extends CustomPainter {
       crop.height * size.height,
     );
 
-    // Dark mask outside crop
     final mask = Paint()..color = Colors.black.withOpacity(0.52);
     final full = Rect.fromLTWH(0, 0, size.width, size.height);
     final path = Path()
@@ -868,17 +809,13 @@ class _CropMaskPainter extends CustomPainter {
       ..fillType = PathFillType.evenOdd;
     canvas.drawPath(path, mask);
 
-    // White outer border
     final borderPaint = Paint()
       ..color = Colors.white.withOpacity(0.6)
       ..strokeWidth = 1.5
       ..style = PaintingStyle.stroke;
     canvas.drawRect(rect, borderPaint);
 
-    // Corner accent handles
     _drawCorners(canvas, rect);
-
-    // Mid-edge handles (visual only, drag logic in overlay)
     _drawMidHandles(canvas, rect);
   }
 
@@ -891,16 +828,12 @@ class _CropMaskPainter extends CustomPainter {
       ..style = PaintingStyle.stroke
       ..strokeCap = StrokeCap.round;
 
-    // TL
     canvas.drawLine(r.topLeft, r.topLeft + const Offset(len, 0), p);
     canvas.drawLine(r.topLeft, r.topLeft + const Offset(0, len), p);
-    // TR
     canvas.drawLine(r.topRight, r.topRight + const Offset(-len, 0), p);
     canvas.drawLine(r.topRight, r.topRight + const Offset(0, len), p);
-    // BL
     canvas.drawLine(r.bottomLeft, r.bottomLeft + const Offset(len, 0), p);
     canvas.drawLine(r.bottomLeft, r.bottomLeft + const Offset(0, -len), p);
-    // BR
     canvas.drawLine(r.bottomRight, r.bottomRight + const Offset(-len, 0), p);
     canvas.drawLine(r.bottomRight, r.bottomRight + const Offset(0, -len), p);
   }
@@ -916,10 +849,10 @@ class _CropMaskPainter extends CustomPainter {
       ..style = PaintingStyle.stroke;
 
     final centers = [
-      Offset(r.center.dx, r.top), // top
-      Offset(r.center.dx, r.bottom), // bottom
-      Offset(r.left, r.center.dy), // left
-      Offset(r.right, r.center.dy), // right
+      Offset(r.center.dx, r.top),
+      Offset(r.center.dx, r.bottom),
+      Offset(r.left, r.center.dy),
+      Offset(r.right, r.center.dy),
     ];
 
     for (final c in centers) {
@@ -935,7 +868,7 @@ class _CropMaskPainter extends CustomPainter {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-//  DRAGGABLE CROP OVERLAY  — drag corners / edges / interior
+//  DRAGGABLE CROP OVERLAY
 // ════════════════════════════════════════════════════════════════════════════
 class _DraggableCropOverlay extends StatefulWidget {
   final Size containerSize;
@@ -1080,7 +1013,7 @@ class _DraggableCropOverlayState extends State<_DraggableCropOverlay> {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-//  SCAN FRAME PAINTER (camera viewfinder corners)
+//  SCAN FRAME PAINTER
 // ════════════════════════════════════════════════════════════════════════════
 class _ScanFramePainter extends CustomPainter {
   @override
